@@ -1,0 +1,7 @@
+__pycache__/model.cpython-310.pyc
+__pycache__/paired_data.cpython-310.pyc
+__pycache__/workflow.cpython-310.pyc
+runs/cervical/.training.lock
+runs/cervical/best.pt
+runs/cervical/history.json
+runs/cervical/last.pt
