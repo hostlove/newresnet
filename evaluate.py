@@ -24,7 +24,9 @@ def main():
         samples = load_partitions(args.data_root, (args.split,), split_csv=args.split_csv)[args.split]
         model, settings = inference_model(args.checkpoint, device)
         loader = make_loader(samples, settings, args.batch_size, args.workers, device)
-        metrics = {"split": args.split, "grades": list(GRADE_NAMES), **run_epoch(model, loader, device)}
+        loss_kind = settings.get("loss_kind", "ce")
+        metrics = {"split": args.split, "grades": list(GRADE_NAMES),
+                   **run_epoch(model, loader, device, loss_kind=loss_kind)}
         if args.output is not None:
             write_json(args.output, metrics)
         print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))

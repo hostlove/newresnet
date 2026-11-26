@@ -239,6 +239,14 @@ class DualResNetClassifier(nn.Module):
             nn.Dropout(0.30), nn.Linear(256, num_classes),
         )
 
+    def configure_fine_tuning(self, *, last_block_only):
+        self.requires_grad_(not last_block_only)
+        if last_block_only:
+            # The local input stem must remain trainable to learn the added mask channel.
+            for module in (self.global_backbone.layer4[-1], self.local_backbone.layer4[-1],
+                           self.local_backbone.conv1, self.classifier):
+                module.requires_grad_(True)
+
     def forward(self, global_image, local_image):
         global_features = self.global_backbone(global_image)
         local_features = self.local_backbone(local_image)

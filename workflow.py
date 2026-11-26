@@ -54,6 +54,15 @@ def _model_inputs(batch, device):
             batch["local_image"].to(device, non_blocking=True))
 
 
+def ranked_probability_score(logits, labels):
+    """Return per-image RPS, averaged over the ordered class boundaries."""
+    probabilities = logits.float().softmax(dim=1)
+    targets = F.one_hot(labels, num_classes=probabilities.shape[1])
+    predicted_cdf = probabilities.cumsum(dim=1)[:, :-1]
+    target_cdf = targets.cumsum(dim=1)[:, :-1]
+    return (predicted_cdf - target_cdf).square().mean(dim=1)
+
+
 def summarize(confusion, loss):
     counts = confusion.to(dtype=torch.float64, device="cpu")
     total = counts.sum()
@@ -70,18 +79,26 @@ def summarize(confusion, loss):
         "accuracy": (correct.sum() / total).item(), "macro_f1": f1.mean().item(),
         "recall_by_grade": [hit / count if count else None for hit, count in zip(correct.tolist(), support.tolist())],
         "mae": ((counts * distance).sum() / total).item(),
+        "error_rate_ge_2": (counts[distance >= 2].sum() / total).item(),
         "qwk": 1 - observed_error / expected_error if expected_error else None,
         "confusion_matrix": confusion.cpu().tolist(),
     }
 
 
-def run_epoch(model, loader, device, *, optimizer=None, scaler=None, grade_weights=None):
+def run_epoch(model, loader, device, *, optimizer=None, scaler=None, grade_weights=None,
+              loss_kind="rps", label_smoothing=0.0, freeze_backbone_stats=False):
+    if loss_kind not in ("rps", "ce"):
+        raise ValueError(f"unsupported loss kind: {loss_kind}")
     training = optimizer is not None
     mixed_precision = training and scaler.is_enabled()
     model.train(training)
+    if training and freeze_backbone_stats:
+        model.global_backbone.eval()
+        model.local_backbone.eval()
     n_classes = len(GRADE_NAMES)
     confusion = torch.zeros(n_classes * n_classes, dtype=torch.long, device=device)
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    rps_sum = torch.zeros_like(loss_sum)
 
     with torch.set_grad_enabled(training):
         for batch in loader:
@@ -90,7 +107,13 @@ def run_epoch(model, loader, device, *, optimizer=None, scaler=None, grade_weigh
                 optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=mixed_precision):
                 logits = model(*_model_inputs(batch, device))
-            losses = F.cross_entropy(logits.float(), labels, reduction="none")
+            rps = ranked_probability_score(logits if loss_kind == "rps" else logits.detach(), labels)
+            if loss_kind == "rps":
+                losses = rps
+            else:
+                # Older cross-entropy checkpoints resume with their original objective.
+                losses = F.cross_entropy(logits.float(), labels, reduction="none",
+                                         label_smoothing=label_smoothing if training else 0.0)
             if grade_weights is not None:
                 losses = losses * grade_weights[labels]
             loss = losses.mean()
@@ -103,9 +126,13 @@ def run_epoch(model, loader, device, *, optimizer=None, scaler=None, grade_weigh
             predictions = logits.argmax(dim=1)
             confusion += torch.bincount(n_classes * labels + predictions, minlength=n_classes * n_classes)
             loss_sum += losses.detach().double().sum()
+            rps_sum += rps.detach().double().sum()
 
     matrix = confusion.reshape(n_classes, n_classes).cpu()
-    return summarize(matrix, loss_sum.item() / len(loader.dataset))
+    sample_count = len(loader.dataset)
+    metrics = summarize(matrix, loss_sum.item() / sample_count)
+    metrics.update(loss_kind=loss_kind, rps=rps_sum.item() / sample_count)
+    return metrics
 
 
 @contextmanager

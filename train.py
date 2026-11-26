@@ -22,6 +22,7 @@ from workflow import (
 DEFAULTS = {
     "batch_size": 8, "image_size": 224, "roi_margin": 0.15, "lr": 3e-4,
     "backbone_lr": None, "weight_decay": 1e-4, "seed": 42, "weight_by_grade": True,
+    "fine_tune": None, "label_smoothing": 0.0,
 }
 
 
@@ -45,14 +46,18 @@ def build_parser():
                         help="新训练默认从 TorchVision ImageNet 权重初始化两条骨干")
     parser.add_argument("--global-weights", type=Path, help="本地 TorchVision ResNet34 ImageNet 原始权重")
     parser.add_argument("--local-weights", type=Path, help="本地 TorchVision ResNet18 ImageNet 原始权重")
+    parser.add_argument("--fine-tune", choices=("last-block", "full"),
+                        help="两路均有预训练权重时默认微调最后残差块、掩膜输入卷积和分类头")
+    parser.add_argument("--label-smoothing", type=float, help="用于旧交叉熵断点续训，RPS 使用真实等级")
     parser.add_argument("--resume", action="store_true", help="从输出目录的 last.pt 恢复")
     add_runtime_args(parser, batch_size=None)
     return parser
 
 
 def _settings(args, previous):
-    settings = DEFAULTS.copy()
+    settings = {**DEFAULTS, "loss_kind": "rps"}
     if previous is not None:
+        settings.update(fine_tune="full", label_smoothing=0.0, loss_kind="ce")
         settings.update(previous["settings"])
     for key in DEFAULTS:
         value = getattr(args, key)
@@ -63,6 +68,13 @@ def _settings(args, previous):
     if settings["backbone_lr"] is None:
         has_transfer_weights = args.pretrained is not False or args.global_weights or args.local_weights
         settings["backbone_lr"] = settings["lr"] * (0.1 if has_transfer_weights else 1.0)
+    if settings["fine_tune"] is None:
+        both_pretrained = args.pretrained is not False or (args.global_weights is not None and args.local_weights is not None)
+        settings["fine_tune"] = "last-block" if both_pretrained else "full"
+    if not 0 <= settings["label_smoothing"] < 1:
+        raise ValueError("--label-smoothing must be in [0, 1)")
+    if settings["loss_kind"] == "rps" and settings["label_smoothing"] != 0.0:
+        raise ValueError("RPS uses hard grades; omit --label-smoothing for a new run")
     if settings["batch_size"] < 1 or settings["image_size"] < 64:
         raise ValueError("--batch-size must be positive and --image-size must be at least 64")
     if not 0 <= settings["roi_margin"] <= 1:
@@ -84,15 +96,19 @@ def _split_digest(partitions):
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def _validation_score(metrics):
-    return metrics["macro_f1"], -metrics["loss"]
+def _validation_score(metrics, loss_kind):
+    if loss_kind == "ce":
+        return metrics["macro_f1"], -metrics["loss"]
+    qwk = metrics["qwk"]
+    return -metrics["mae"], qwk if qwk is not None else -math.inf
 
 
 def _write_reports(output, state, history):
     if "val" in history[-1]:
-        earlier_scores = (_validation_score(row["val"]) for row in history[:-1])
-        previous_best = max(earlier_scores, default=(-1.0, -math.inf))
-        if _validation_score(history[-1]["val"]) > previous_best:
+        loss_kind = state["settings"].get("loss_kind", "ce")
+        earlier_scores = (_validation_score(row["val"], loss_kind) for row in history[:-1])
+        previous_best = max(earlier_scores, default=(-math.inf, -math.inf))
+        if _validation_score(history[-1]["val"], loss_kind) > previous_best:
             best = {key: state[key] for key in ("format", "grades", "settings", "epoch", "model")}
             save_checkpoint(output / "best.pt", best)
     write_json(output / "history.json", history)
@@ -107,6 +123,7 @@ def _train(args, partitions, device):
     if previous is not None and previous.get("split_digest") != digest:
         raise ValueError("--resume requires the same split assignments and relative paths")
     settings = _settings(args, previous)
+    loss_kind = settings["loss_kind"]
     history = previous["history"] if previous is not None else []
     start_epoch = history[-1]["epoch"] + 1 if history else 1
 
@@ -126,6 +143,8 @@ def _train(args, partitions, device):
         num_classes=len(GRADE_NAMES), pretrained=auto_pretrained,
         global_weights=args.global_weights, local_weights=args.local_weights,
     ).to(device)
+    last_block_only = settings["fine_tune"] == "last-block"
+    model.configure_fine_tuning(last_block_only=last_block_only)
     optimizer = torch.optim.AdamW([
         {"params": chain(model.global_backbone.parameters(), model.local_backbone.parameters()),
          "lr": settings["backbone_lr"]},
@@ -142,6 +161,9 @@ def _train(args, partitions, device):
         del previous
 
     print(f"device={device}  amp={scaler.is_enabled()}  grades={list(GRADE_NAMES)}  output={output}", flush=True)
+    trainable_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    print(f"fine_tune={settings['fine_tune']}  loss_kind={loss_kind}  label_smoothing={settings['label_smoothing']}  "
+          f"trainable_params={trainable_params}", flush=True)
     train_counts = None
     for name, samples in partitions.items():
         counts = torch.bincount(torch.tensor([sample.grade for sample in samples]), minlength=len(GRADE_NAMES))
@@ -169,10 +191,12 @@ def _train(args, partitions, device):
         row = {
             "epoch": epoch,
             "train": run_epoch(model, train_loader, device, optimizer=optimizer, scaler=scaler,
-                               grade_weights=grade_weights),
+                               grade_weights=grade_weights, loss_kind=loss_kind,
+                               label_smoothing=settings["label_smoothing"],
+                               freeze_backbone_stats=last_block_only),
         }
         if val_loader is not None:
-            row["val"] = run_epoch(model, val_loader, device)
+            row["val"] = run_epoch(model, val_loader, device, loss_kind=loss_kind)
             scheduler.step(row["val"]["loss"])
         history.append(row)
         state = {
@@ -183,11 +207,14 @@ def _train(args, partitions, device):
         }
         save_checkpoint(output / "last.pt", state)
         _write_reports(output, state, history)
-        scores = "  ".join(
-            f"{name}_loss={metrics['loss']:.4f} {name}_macro_f1={metrics['macro_f1']:.4f}"
-            for name, metrics in row.items() if name != "epoch"
-        )
-        print(f"epoch={epoch}/{args.epochs}  {scores}", flush=True)
+        scores = []
+        for name in partitions:
+            metrics = row[name]
+            qwk = f"{metrics['qwk']:.4f}" if metrics["qwk"] is not None else "n/a"
+            scores.append(f"{name}_loss={metrics['loss']:.4f} {name}_rps={metrics['rps']:.4f} "
+                          f"{name}_mae={metrics['mae']:.4f} {name}_qwk={qwk} "
+                          f"{name}_macro_f1={metrics['macro_f1']:.4f}")
+        print(f"epoch={epoch}/{args.epochs}  {'  '.join(scores)}", flush=True)
 
 
 def main():
