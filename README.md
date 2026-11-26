@@ -49,6 +49,8 @@ python train.py --data-root ../datatests --train-only --no-pretrained --device c
 ## 评估和预测
 
 ```bash
+
+python export_validation.py --data-root ../datasets --split-csv ../datasets/splits.csv --checkpoint audit/best_fixed.pt --output audit/val_review.csv --device cuda
 python evaluate.py --data-root ../datasets --split-csv ../datasets/splits.csv --split test --checkpoint runs/cervical_rps/best.pt --output runs/cervical_rps/test.json
 python predict.py --image ../unlabeled/case01.JPG --checkpoint runs/cervical_rps/best.pt
 python batch_predict.py --input ../unlabeled --checkpoint runs/cervical_rps/best.pt --output runs/cervical_rps/predictions.csv
