@@ -5,3 +5,4 @@ runs/cervical/.training.lock
 runs/cervical/best.pt
 runs/cervical/history.json
 runs/cervical/last.pt
+/runs/
