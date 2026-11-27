@@ -30,9 +30,9 @@ def main():
 
     try:
         device = select_device(args.device)
-        samples = load_partitions(args.data_root, ("val",), split_csv=args.split_csv)["val"]
+        # samples = load_partitions(args.data_root, ("val",), split_csv=args.split_csv)["val"]
         # samples = load_partitions(args.data_root, ("train",), split_csv=args.split_csv)["train"]
-        # samples = load_partitions(args.data_root, ("test",), split_csv=args.split_csv, labeled_eval=True)["test"]
+        samples = load_partitions(args.data_root, ("test",), split_csv=args.split_csv, labeled_eval=True)["test"]
         samples_by_path = {sample.key: sample for sample in samples}
 
         checkpoint = read_checkpoint(args.checkpoint)
