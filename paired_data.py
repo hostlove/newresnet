@@ -16,7 +16,7 @@ GRADE_NAMES = ("正常", "轻微", "中度", "重度")
 GRADE_DIRS = {name: grade for grade, name in enumerate(GRADE_NAMES)}
 GRADE_DIRS.update({str(grade): grade for grade in range(len(GRADE_NAMES))})
 SPLITS = ("train", "val", "test")
-IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
@@ -34,15 +34,21 @@ def _is_mask(path):
     return path.name.casefold().endswith("_seg.png")
 
 
-def _pairs(folder, only_stem=None):
-    images, masks = {}, {}
+def _is_image(path):
+    return path.suffix.casefold() in IMAGE_SUFFIXES and not _is_mask(path)
+
+
+def _pairs(folder, only_stem=None, *, require_png_pairs=False):
+    images, masks, optional_pngs = {}, {}, {}
     for path in sorted(folder.iterdir()):
         if not path.is_file():
             continue
-        if path.suffix.casefold() in IMAGE_SUFFIXES:
-            key, indexed = path.stem.casefold(), images
-        elif _is_mask(path):
+        if _is_mask(path):
             key, indexed = path.stem[:-4].casefold(), masks
+        elif path.suffix.casefold() == ".png" and not require_png_pairs:
+            key, indexed = path.stem.casefold(), optional_pngs
+        elif path.suffix.casefold() in IMAGE_SUFFIXES:
+            key, indexed = path.stem.casefold(), images
         else:
             continue
         if only_stem is not None and key != only_stem:
@@ -50,11 +56,14 @@ def _pairs(folder, only_stem=None):
         if key in indexed:
             raise ValueError(f"duplicate image or mask for the same stem: {indexed[key]} and {path}")
         indexed[key] = path
+    # Existing grade folders can contain PNG previews alongside their JPEG pairs.
+    for key in masks.keys() & optional_pngs.keys():
+        images.setdefault(key, optional_pngs[key])
     for key in sorted(images.keys() | masks.keys()):
         if key not in masks:
             raise ValueError(f"missing <stem>_seg.png for {images[key]}")
         if key not in images:
-            raise ValueError(f"segmentation PNG has no matching JPG/JPEG: {masks[key]}")
+            raise ValueError(f"segmentation PNG has no matching JPG/JPEG/PNG original: {masks[key]}")
         yield images[key], masks[key]
 
 
@@ -66,7 +75,7 @@ def _grade_directory(root, directory):
         if not folder.is_dir():
             continue
         if folder.name not in GRADE_DIRS:
-            if any(p.is_file() and (p.suffix.casefold() in IMAGE_SUFFIXES or _is_mask(p))
+            if any(p.is_file() and (p.suffix.casefold() in {".jpg", ".jpeg"} or _is_mask(p))
                    for p in folder.iterdir()):
                 raise ValueError(f"unrecognized grade folder: {folder}")
             continue
@@ -89,9 +98,9 @@ def _manifest_splits(root, manifest):
             patient = (row["patient_id"] or "").strip()
             split = (row["split"] or "").strip().lower()
             if not text or Path(text).is_absolute() or not patient or split not in SPLITS:
-                raise ValueError(f"{location}: expected a relative JPG/JPEG path, patient ID and train/val/test")
+                raise ValueError(f"{location}: expected a relative JPG/JPEG/PNG path, patient ID and train/val/test")
             image = (root / text).resolve()
-            if not image.is_relative_to(root) or not image.is_file() or image.suffix.casefold() not in IMAGE_SUFFIXES:
+            if not image.is_relative_to(root) or not image.is_file() or not _is_image(image):
                 raise ValueError(f"{location}: original image not found under data root: {text}")
             if image in seen_images:
                 raise ValueError(f"{location}: duplicate original image: {text}")
@@ -103,8 +112,11 @@ def _manifest_splits(root, manifest):
                 raise ValueError(f"{location}: original image must be inside a grade folder")
             if folder not in pair_indexes:
                 pair_indexes[folder] = dict(_pairs(folder))
+            mask = pair_indexes[folder].get(image)
+            if mask is None:
+                raise ValueError(f"{location}: cannot pair {image.name} with a unique <stem>_seg.png")
             partitions[split].append(Sample(
-                image, pair_indexes[folder][image], image.relative_to(root).as_posix(),
+                image, mask, image.relative_to(root).as_posix(),
                 GRADE_DIRS[folder.name], patient,
             ))
             patient_splits[patient] = split
@@ -136,18 +148,19 @@ def load_partitions(data_root, names, *, split_csv=None, train_only=False):
     return selected
 
 
-def prediction_samples(source):
+def prediction_samples(source, *, require_png_pairs=False):
     root = Path(source).resolve()
-    if root.is_file() and root.suffix.casefold() in IMAGE_SUFFIXES:
-        return [Sample(image, mask, image.name) for image, mask in _pairs(root.parent, root.stem.casefold())]
+    if root.is_file() and _is_image(root):
+        pairs = _pairs(root.parent, root.stem.casefold(), require_png_pairs=root.suffix.casefold() == ".png")
+        return [Sample(image, mask, image.name) for image, mask in pairs]
     if not root.is_dir():
-        raise ValueError(f"prediction input must be a JPG/JPEG or a directory of pairs: {root}")
+        raise ValueError(f"prediction input must be a JPG/JPEG/PNG original or a directory of pairs: {root}")
     folders = sorted({path.parent for path in root.rglob("*") if path.is_file()
-                      and (path.suffix.casefold() in IMAGE_SUFFIXES or _is_mask(path))})
+                      and path.suffix.casefold() in IMAGE_SUFFIXES})
     samples = [Sample(image, mask, image.relative_to(root).as_posix())
-               for folder in folders for image, mask in _pairs(folder)]
+               for folder in folders for image, mask in _pairs(folder, require_png_pairs=require_png_pairs)]
     if not samples:
-        raise ValueError(f"no JPG/JPEG and segmentation PNG pairs under {root}")
+        raise ValueError(f"no JPG/JPEG/PNG originals with segmentation PNGs under {root}")
     return samples
 
 
