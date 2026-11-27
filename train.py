@@ -21,7 +21,7 @@ from workflow import (
 
 DEFAULTS = {
     "batch_size": 8, "image_size": 224, "roi_margin": 0.15, "lr": 3e-4,
-    "backbone_lr": None, "weight_decay": 1e-4, "seed": 42, "weight_by_grade": True,
+    "backbone_lr": 1e-5, "weight_decay": 1e-4, "seed": 42, "weight_by_grade": True,
     "fine_tune": None, "label_smoothing": 0.0,
 }
 
@@ -215,6 +215,8 @@ def _train(args, partitions, device):
                           f"{name}_mae={metrics['mae']:.4f} {name}_qwk={qwk} "
                           f"{name}_macro_f1={metrics['macro_f1']:.4f}")
         print(f"epoch={epoch}/{args.epochs}  {'  '.join(scores)}", flush=True)
+        for name in partitions:
+            print(f"  {name}_confusion_matrix={row[name]['confusion_matrix']}", flush=True)
 
 
 def main():
