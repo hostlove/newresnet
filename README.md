@@ -28,6 +28,9 @@ datasets/
 ```bash
 python -m pip install -r requirements.txt
 python train.py --data-root ../datasets --split-csv ../datasets/splits.csv --device cuda --epochs 30 --output-dir runs/cervical_rps
+# 新划分的数据集
+python train.py --data-root ../datasets --split-csv ./outputemp/csvv/splits_boundary.csv --device cuda --epochs 20 --output-dir runs/cervical_rps1127
+
 ```
 
 新训练默认用 ImageNet 权重，并在首次运行时下载所需文件。提前下载可运行 `python load_weights.py`，文件默认在用户目录的 `.cache/torch/hub/checkpoints/`。也可在训练命令里加 `--global-weights /path/resnet34.pth --local-weights /path/resnet18.pth` 使用两个本地 TorchVision 权重字典。CUDA 训练默认使用混合精度，分类头与骨干使用不同学习率。
