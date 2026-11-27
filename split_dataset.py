@@ -9,6 +9,8 @@ from collections import Counter, defaultdict
 from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 
+from dataset_manifest import GRADE_NAMES, SPLIT_COLUMNS, SPLITS, read_manifest
+
 
 def _read_patient_ids(path, image_paths):
     patient_ids = {}
@@ -110,23 +112,57 @@ def _write_csv(path, columns, rows, rollback):
         writer.writerows(rows)
 
 
-def generate_splits(args):
-    from cervical.data import GRADE_NAMES, SPLITS, load_splits
+def _split_from_csv(args, proportions):
+    with args.input_csv.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(read_manifest(stream, args.input_csv, require_split=False))
+    if len(rows) != len({row.image_path for row in rows}):
+        raise ValueError(f"{args.input_csv} 中存在重复的原片路径")
+    patient_grades = defaultdict(Counter)
+    for row in rows:
+        patient_grades[row.patient_id][row.grade, row.true_grade is not None] += 1
+    assignment = _assign_patients(patient_grades, proportions, args.seed)
 
+    output = (args.output or args.input_csv.with_name("splits_repartitioned.csv")).absolute()
+    with ExitStack() as rollback:
+        split_rows = (row.csv_row(split=assignment[row.patient_id]) for row in rows)
+        _write_csv(output, SPLIT_COLUMNS, split_rows, rollback)
+        if args.data_root is not None:
+            from paired_data import load_partitions
+
+            load_partitions(args.data_root, tuple(proportions), split_csv=output)
+        rollback.pop_all()
+
+    print(f"已写入 {output}")
+    for split in proportions:
+        selected = [row for row in rows if assignment[row.patient_id] == split]
+        labeled = sum(row.true_grade is not None for row in selected)
+        counts = Counter(row.grade for row in selected)
+        print(f"{split}  患者 {len({row.patient_id for row in selected})} 位，原片 {len(selected)} 张，"
+              f"原有或已复核标签 {labeled} 张，伪标签 {len(selected) - labeled} 张，"
+              f"等级数量 {[counts[grade] for grade in range(len(GRADE_NAMES))]}")
+
+
+def generate_splits(args):
     train_ratio, val_ratio, test_ratio = args.ratios
     total_ratio = sum(args.ratios)
     if not math.isfinite(total_ratio) or train_ratio <= 0 or val_ratio <= 0 or test_ratio < 0:
         raise ValueError("--ratios 需要为训练和验证指定正数，测试可以设为 0")
     proportions = {split: ratio / total_ratio for split, ratio in zip(SPLITS, args.ratios) if ratio > 0}
+    if args.input_csv is not None:
+        _split_from_csv(args, proportions)
+        return
+
+    from paired_data import load_partitions
 
     root = args.data_root.resolve()
-    cases = load_splits(root, ("train",), train_only=True)["train"]
+    cases = load_partitions(root, ("train",), train_only=True)["train"]
     cases.sort(key=lambda case: case.key)
     patient_ids = _patient_ids(args, cases)
     patient_grades = defaultdict(Counter)
     for case in cases:
         patient_grades[patient_ids[case.key]][case.grade] += 1
     assignment = _assign_patients(patient_grades, proportions, args.seed)
+    grades = {case.key: case.grade for case in cases}
 
     output = (args.output or root / "splits.csv").absolute()
     if output.exists():
@@ -147,9 +183,10 @@ def generate_splits(args):
             else:
                 _write_csv(patient_output, ("image_path", "patient_id"), patient_rows, rollback)
 
-        split_rows = ((image_path, patient_id, assignment[patient_id]) for image_path, patient_id in patient_rows)
-        _write_csv(output, ("image_path", "patient_id", "split"), split_rows, rollback)
-        partitions = load_splits(root, tuple(proportions), split_csv=output)
+        split_rows = ((image_path, patient_id, assignment[patient_id], grades[image_path], grades[image_path])
+                      for image_path, patient_id in patient_rows)
+        _write_csv(output, SPLIT_COLUMNS, split_rows, rollback)
+        partitions = load_partitions(root, tuple(proportions), split_csv=output)
         rollback.pop_all()
 
     if patient_output is not None:
@@ -164,9 +201,10 @@ def generate_splits(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从颈椎数据目录生成患者表并按患者划分数据")
-    parser.add_argument("--data-root", type=Path, required=True, help="包含 0/1/2/3 或中文等级目录的数据根目录")
+    parser = argparse.ArgumentParser(description="从数据目录或合并 CSV 按患者划分颈椎影像")
+    parser.add_argument("--data-root", type=Path, help="数据根目录。使用 --input-csv 时可选，用于检查图片配对")
     source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input-csv", type=Path, help="合并后的数据清单，将重新确定每位患者的 split")
     source.add_argument("--patient-csv", type=Path, help="包含 image_path,patient_id 的患者对应表")
     source.add_argument("--patient-regex", help="从原片文件名提取患者编号并生成 patients.csv，正则包含一个捕获组")
     source.add_argument("--one-image-per-patient", action="store_true", help="确认每位患者只有一张原片后使用")
@@ -174,9 +212,12 @@ def main():
                         help="训练、验证、测试的目标比例，默认 70 15 15")
     parser.add_argument("--seed", type=int, default=42, help="划分随机种子，默认 42")
     parser.add_argument("--patients-output", type=Path, help="生成的患者表路径，默认写入数据根目录的 patients.csv")
-    parser.add_argument("--output", type=Path, help="输出文件，默认写入数据根目录的 splits.csv")
+    parser.add_argument("--output", type=Path,
+                        help="输出 CSV。目录模式默认 splits.csv，清单模式默认 splits_repartitioned.csv")
     args = parser.parse_args()
-    if args.patient_csv is not None and args.patients_output is not None:
+    if args.input_csv is None and args.data_root is None:
+        parser.error("从目录划分时需要 --data-root")
+    if (args.patient_csv is not None or args.input_csv is not None) and args.patients_output is not None:
         parser.error("--patients-output 用于从目录生成患者表，请选择 --patient-regex 或 --one-image-per-patient")
     try:
         generate_splits(args)

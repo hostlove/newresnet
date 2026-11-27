@@ -233,7 +233,8 @@ def main():
     try:
         device = select_device(args.device)
         names = ("train",) if args.train_only else ("train", "val")
-        partitions = load_partitions(args.data_root, names, split_csv=args.split_csv, train_only=args.train_only)
+        partitions = load_partitions(args.data_root, names, split_csv=args.split_csv,
+                                     train_only=args.train_only, labeled_eval=True)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(str(args.output_dir / ".training.lock"), timeout=0):
             _train(args, partitions, device)

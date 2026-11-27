@@ -21,7 +21,8 @@ def main():
         parser.error("--output must use a .json file")
     try:
         device = select_device(args.device)
-        samples = load_partitions(args.data_root, (args.split,), split_csv=args.split_csv)[args.split]
+        partitions = load_partitions(args.data_root, (args.split,), split_csv=args.split_csv, labeled_eval=True)
+        samples = partitions[args.split]
         model, settings = inference_model(args.checkpoint, device)
         loader = make_loader(samples, settings, args.batch_size, args.workers, device)
         loss_kind = settings.get("loss_kind", "ce")

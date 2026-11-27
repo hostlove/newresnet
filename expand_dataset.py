@@ -13,6 +13,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
+from dataset_manifest import SPLIT_COLUMNS, read_manifest
 from paired_data import GRADE_NAMES, SPLITS, load_partitions, prediction_samples
 from split_dataset import _patient_ids
 from workflow import (
@@ -20,17 +21,14 @@ from workflow import (
 )
 
 
-SPLIT_COLUMNS = ("image_path", "patient_id", "split")
 DEFAULT_PATIENT_REGEX = r"^[^_]+_([A-Za-z]{2}[0-9]{12})_[0-9]+$"
 
 
 def _read_manifest(root, manifest):
     original = manifest.read_bytes()
-    reader = csv.DictReader(io.StringIO(original.decode("utf-8-sig"), newline=""))
-    if not set(SPLIT_COLUMNS).issubset(reader.fieldnames or ()):
-        raise ValueError(f"{manifest} 需要 image_path,patient_id,split 三列")
-    rows = [tuple(row[field] for field in SPLIT_COLUMNS) for row in reader]
-    present = {(row[2] or "").strip().lower() for row in rows}
+    parsed = list(read_manifest(io.StringIO(original.decode("utf-8-sig"), newline=""), manifest))
+    rows = [row.csv_row() for row in parsed]
+    present = {row.split for row in parsed}
     partitions = load_partitions(root, tuple(split for split in SPLITS if split in present), split_csv=manifest)
     return original, rows, partitions
 
@@ -105,7 +103,7 @@ def _append_manifest(root, pseudo_root, manifest, original, rows, output, accept
                 image = folder / sample.image.name
                 shutil.copy2(sample.image, image)
                 shutil.copy2(sample.mask, folder / sample.mask.name)
-                additions.append((image.relative_to(root).as_posix(), patient_ids[sample.key], "train"))
+                additions.append((image.relative_to(root).as_posix(), patient_ids[sample.key], "train", grade, None))
 
         if manifest.read_bytes() != original:
             raise ValueError(f"运行期间划分表已更新，请用最新清单重新运行：{manifest}")

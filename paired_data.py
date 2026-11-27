@@ -1,6 +1,5 @@
 """Pair cervical radiographs with segmentation PNGs and build aligned inputs."""
 
-import csv
 import math
 import random
 from dataclasses import dataclass
@@ -11,12 +10,8 @@ from PIL import Image, ImageEnhance
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
+from dataset_manifest import GRADE_DIRS, GRADE_NAMES, IMAGE_SUFFIXES, SPLITS, read_manifest
 
-GRADE_NAMES = ("正常", "轻微", "中度", "重度")
-GRADE_DIRS = {name: grade for grade, name in enumerate(GRADE_NAMES)}
-GRADE_DIRS.update({str(grade): grade for grade in range(len(GRADE_NAMES))})
-SPLITS = ("train", "val", "test")
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
@@ -28,6 +23,7 @@ class Sample:
     key: str
     grade: int | None = None
     patient_id: str | None = None
+    true_grade: int | None = None
 
 
 def _is_mask(path):
@@ -79,8 +75,9 @@ def _grade_directory(root, directory):
                    for p in folder.iterdir()):
                 raise ValueError(f"unrecognized grade folder: {folder}")
             continue
+        grade = GRADE_DIRS[folder.name]
         for image, mask in _pairs(folder):
-            samples.append(Sample(image, mask, image.relative_to(root).as_posix(), GRADE_DIRS[folder.name]))
+            samples.append(Sample(image, mask, image.relative_to(root).as_posix(), grade, true_grade=grade))
     return samples
 
 
@@ -89,42 +86,32 @@ def _manifest_splits(root, manifest):
     patient_splits, pair_indexes = {}, {}
     seen_images = set()
     with Path(manifest).open(encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if not {"image_path", "patient_id", "split"}.issubset(reader.fieldnames or ()):
-            raise ValueError("split CSV requires image_path, patient_id, and split columns")
-        for row in reader:
-            location = f"{manifest}:{reader.line_num}"
-            text = (row["image_path"] or "").strip().replace("\\", "/")
-            patient = (row["patient_id"] or "").strip()
-            split = (row["split"] or "").strip().lower()
-            if not text or Path(text).is_absolute() or not patient or split not in SPLITS:
-                raise ValueError(f"{location}: expected a relative JPG/JPEG/PNG path, patient ID and train/val/test")
-            image = (root / text).resolve()
+        for row in read_manifest(stream, manifest):
+            location = f"{manifest}:{row.line}"
+            image = (root / row.image_path).resolve()
             if not image.is_relative_to(root) or not image.is_file() or not _is_image(image):
-                raise ValueError(f"{location}: original image not found under data root: {text}")
+                raise ValueError(f"{location}: original image not found under data root: {row.image_path}")
             if image in seen_images:
-                raise ValueError(f"{location}: duplicate original image: {text}")
-            if patient in patient_splits and patient_splits[patient] != split:
+                raise ValueError(f"{location}: duplicate original image: {row.image_path}")
+            if row.patient_id in patient_splits and patient_splits[row.patient_id] != row.split:
                 raise ValueError(f"{location}: the same patient appears in multiple splits")
 
             folder = image.parent
-            if folder.name not in GRADE_DIRS:
-                raise ValueError(f"{location}: original image must be inside a grade folder")
             if folder not in pair_indexes:
                 pair_indexes[folder] = dict(_pairs(folder))
             mask = pair_indexes[folder].get(image)
             if mask is None:
                 raise ValueError(f"{location}: cannot pair {image.name} with a unique <stem>_seg.png")
-            partitions[split].append(Sample(
+            partitions[row.split].append(Sample(
                 image, mask, image.relative_to(root).as_posix(),
-                GRADE_DIRS[folder.name], patient,
+                row.grade, row.patient_id, row.true_grade,
             ))
-            patient_splits[patient] = split
+            patient_splits[row.patient_id] = row.split
             seen_images.add(image)
     return partitions
 
 
-def load_partitions(data_root, names, *, split_csv=None, train_only=False):
+def load_partitions(data_root, names, *, split_csv=None, train_only=False, labeled_eval=False):
     root = Path(data_root).resolve()
     if not root.is_dir():
         raise ValueError(f"data root does not exist: {root}")
@@ -139,6 +126,10 @@ def load_partitions(data_root, names, *, split_csv=None, train_only=False):
         samples = sorted(partitions[name], key=lambda sample: sample.key)
         if not samples:
             raise ValueError(f"split {name!r} has no labeled pairs")
+        if labeled_eval and name in ("val", "test"):
+            samples = [sample for sample in samples if sample.true_grade is not None]
+            if not samples:
+                raise ValueError(f"split {name!r} has no samples with a true_grade for evaluation")
         for sample in samples:
             image = sample.image.resolve()
             if image in seen_images:
